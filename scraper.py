@@ -24,17 +24,17 @@ all_values = sheet.get_all_values()
 headers = all_values[0]
 rows = all_values[1:]
 
-# Ensure 'Turnover' and 'Employee Size' columns exist
+# Ensure required columns exist
 if "Turnover" not in headers:
     headers.append("Turnover")
     for row in rows:
         row.append("")
+
 if "Employee Size" not in headers:
     headers.append("Employee Size")
     for row in rows:
         row.append("")
 
-# Update headers if changed
 sheet.update(values=[headers], range_name="A1")
 
 # Get column indexes
@@ -60,6 +60,7 @@ def create_endole_slug(company_name):
 async def scrape_company_data(page, reg_number, company_slug):
     url = f"https://app.endole.co.uk/company/{reg_number}/{company_slug}"
     print(f"🔗 Visiting: {url}")
+
     await page.goto(url)
     await page.wait_for_load_state("domcontentloaded")
     await page.wait_for_timeout(5000)
@@ -68,13 +69,12 @@ async def scrape_company_data(page, reg_number, company_slug):
 
     try:
         fin_frame = next((f for f in page.frames if "tile=financials" in f.url), None)
+
         if fin_frame:
-            # Turnover
             t_elem = fin_frame.locator("//div[contains(text(),'Turnover')]/following-sibling::div")
             if await t_elem.count() > 0:
                 turnover = (await t_elem.first.text_content() or "").strip()
 
-            # Employees
             e_elem = fin_frame.locator("//div[contains(text(),'Employees')]/following-sibling::div")
             if await e_elem.count() > 0:
                 employees = (await e_elem.first.text_content() or "").strip()
@@ -99,22 +99,24 @@ async def main():
         await page.fill("input[name='password']", PASSWORD)
         await page.click("button[type='submit']")
         await page.wait_for_load_state("networkidle")
+
         print("✅ Logged in successfully.\n")
 
-        # Loop through rows
+        updates = []
+        batch_size = 20
+
         for idx, row in enumerate(rows):
+
             try:
                 reg_number = row[reg_num_idx].strip()
                 reg_name = row[reg_name_idx].strip()
                 turnover_val = row[turnover_idx].strip() if row[turnover_idx] else ""
                 employee_val = row[employee_idx].strip() if row[employee_idx] else ""
 
-                # Skip if no reg_number or name
                 if not reg_number or not reg_name or reg_number.lower() == "nan":
                     print(f"⏭️ Skipping invalid row {idx + 2}")
                     continue
 
-                # Skip if Turnover or Employee Size already filled
                 if turnover_val or employee_val:
                     print(f"⏭️ Skipping row {idx + 2}, already has data")
                     continue
@@ -122,24 +124,45 @@ async def main():
                 slug = create_endole_slug(reg_name)
                 turnover, emp_size = await scrape_company_data(page, reg_number, slug)
 
-                # Update Google Sheet cells directly
-                sheet.update_cell(idx + 2, turnover_idx + 1, turnover)
-                sheet.update_cell(idx + 2, employee_idx + 1, emp_size)
-                print(f"📝 Updated row {idx + 2} in sheet.")
+                row_number = idx + 2
 
-                # ✅ Close the company tab inside Endole
+                updates.append({
+                    "range": f"{chr(65 + turnover_idx)}{row_number}",
+                    "values": [[turnover]]
+                })
+
+                updates.append({
+                    "range": f"{chr(65 + employee_idx)}{row_number}",
+                    "values": [[emp_size]]
+                })
+
+                print(f"📝 Queued update for row {row_number}")
+
+                # Close Endole tab
                 try:
                     close_btn = page.locator("div._close")
                     if await close_btn.count() > 0:
                         await close_btn.first.click()
-                        print(f"🗂 Closed company tab for row {idx + 2}")
-                        await page.wait_for_timeout(1000)  # small wait for UI to update
-                except Exception as e:
-                    print(f"⚠️ Could not close tab for row {idx + 2}: {e}")
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
 
-                time.sleep(1)  # avoid Google API rate limit
+                # Send batch update
+                if len(updates) >= batch_size:
+                    print("🚀 Sending batch update to Google Sheets...")
+                    sheet.batch_update(updates)
+                    updates.clear()
+
+                    # pause so n8n workflows can also use the API
+                    time.sleep(3)
+
             except Exception as e:
                 print(f"❌ Error at row {idx + 2}: {e}")
+
+        # Final batch update
+        if updates:
+            print("🚀 Sending final batch update...")
+            sheet.batch_update(updates)
 
         await context.close()
         await browser.close()
